@@ -55,13 +55,30 @@ if ! command -v uv > /dev/null 2>&1; then
     done
     
     
-    # Final fallback: direct download of x86_64 binary
+    # Final fallback: direct download of the binary for this OS/architecture
     if ! command -v uv > /dev/null 2>&1; then
-        echo "Attempting direct binary download for x86_64..."
-        mkdir -p "$HOME/.local/bin"
-        curl -L "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C "$HOME/.local/bin"
-        chmod +x "$HOME/.local/bin/uv"
-        export PATH="$HOME/.local/bin:$PATH"
+        case "$(uname -m)" in
+            x86_64|amd64) uv_arch="x86_64" ;;
+            aarch64|arm64) uv_arch="aarch64" ;;
+            *) uv_arch="" ;;
+        esac
+        if [ "$(uname -s)" = "Darwin" ]; then
+            uv_target="${uv_arch}-apple-darwin"
+        else
+            uv_target="${uv_arch}-unknown-linux-gnu"
+        fi
+
+        if [ -z "$uv_arch" ]; then
+            echo "Unsupported architecture for a uv binary download: $(uname -m)"
+        else
+            echo "Attempting direct binary download for ${uv_target}..."
+            mkdir -p "$HOME/.local/bin"
+            # The tarball contains a uv-<target>/ directory, so strip it
+            curl -L "https://github.com/astral-sh/uv/releases/latest/download/uv-${uv_target}.tar.gz" |
+                tar -xz -C "$HOME/.local/bin" --strip-components=1
+            chmod +x "$HOME/.local/bin/uv"
+            export PATH="$HOME/.local/bin:$PATH"
+        fi
     fi
     
     # Final check
@@ -135,9 +152,15 @@ for rc_file in "${HOME}/.zshrc" "${HOME}/.bashrc" "${HOME}/.profile" "${HOME}/.b
         # Remove pyenv configuration if present
         if grep -q "PYENV_ROOT" "$rc_file"; then
             echo "Removing pyenv configuration from $rc_file..."
-            sed -i '/# pyenv configuration/,/fi/d' "$rc_file" || true
-            sed -i '/PYENV_ROOT/d' "$rc_file" || true
-            sed -i '/pyenv init/d' "$rc_file" || true
+            # BSD sed (macOS) requires an argument to -i; GNU sed requires none
+            if sed --version > /dev/null 2>&1; then
+                sed_inplace=(sed -i)
+            else
+                sed_inplace=(sed -i '')
+            fi
+            "${sed_inplace[@]}" '/# pyenv configuration/,/fi/d' "$rc_file" || true
+            "${sed_inplace[@]}" '/PYENV_ROOT/d' "$rc_file" || true
+            "${sed_inplace[@]}" '/pyenv init/d' "$rc_file" || true
         fi
         
         

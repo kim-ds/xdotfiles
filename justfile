@@ -1,3 +1,19 @@
+# ===== Platform configuration =====
+# Every recipe below branches on this instead of assuming Debian/Ubuntu.
+platform := if os() == "macos" { "macos" } else { "linux" }
+
+# Node.js version. Homebrew disabled node@18 (Node 18 is EOL), so both
+# platforms track the 22.x LTS line to stay on the same major version.
+NODE_VERSION := 'v22.23.2'
+NODE_BREW_FORMULA := 'node@22'
+
+NVIM_VERSION := 'v0.9.5'
+
+# Put Homebrew on PATH inside a recipe (Apple Silicon, Intel, Linuxbrew).
+# Recipes that shell out to brew start with {{brew_env}} so they work even when
+# invoked directly from a shell that has not sourced the updated .zshrc yet.
+brew_env := 'for b in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do [ -x "$b" ] && eval "$($b shellenv)" && break; done'
+
 # Default recipe (run when just is called without arguments)
 default: update-gitconfig update-zshrc install-oh-my-zsh install-plugins setup-rsa install-python-env install-nodejs install-nvim update-nvim install-aws install-vscode link-claude-config restart-shell verify-install optional-installs
 
@@ -38,14 +54,15 @@ install-oh-my-zsh: update-zshrc
 # Install Zsh plugins
 install-plugins: install-oh-my-zsh
     #!/bin/bash
-    declare -A plugins=(
-        ["ohmyzsh-full-autoupdate"]="https://github.com/Pilaton/OhMyZsh-full-autoupdate.git"
-        ["zsh-autosuggestions"]="https://github.com/zsh-users/zsh-autosuggestions.git"
-        ["zsh-completions"]="https://github.com/zsh-users/zsh-completions.git"
-        ["zsh-vi-mode"]="https://github.com/jeffreytse/zsh-vi-mode.git"
-    )
-    for plugin in "${!plugins[@]}"; do
-        plugin_url="${plugins[$plugin]}"
+    # "name|url" pairs rather than an associative array: macOS ships bash 3.2,
+    # which has no `declare -A`.
+    for entry in \
+        "ohmyzsh-full-autoupdate|https://github.com/Pilaton/OhMyZsh-full-autoupdate.git" \
+        "zsh-autosuggestions|https://github.com/zsh-users/zsh-autosuggestions.git" \
+        "zsh-completions|https://github.com/zsh-users/zsh-completions.git" \
+        "zsh-vi-mode|https://github.com/jeffreytse/zsh-vi-mode.git"; do
+        plugin="${entry%%|*}"
+        plugin_url="${entry##*|}"
         plugin_dir="${HOME}/.oh-my-zsh/custom/plugins/${plugin}"
         if [ ! -d "$plugin_dir" ]; then
             git clone "$plugin_url" "$plugin_dir"
@@ -72,63 +89,87 @@ install-python-env: install-plugins
 # Install Node.js
 install-nodejs:
     #!/bin/bash
+    {{brew_env}}
     # Check for both Node.js and npm
-    if ! type node > /dev/null 2>&1 || ! type npm > /dev/null 2>&1; then
-        echo "Installing Node.js and npm from binary distribution..."
-        # Use the latest LTS version
-        NODE_VERSION="v18.18.0"
-        wget https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-x64.tar.xz
-        tar -xf node-${NODE_VERSION}-linux-x64.tar.xz
-        sudo cp -r node-${NODE_VERSION}-linux-x64/bin/* /usr/local/bin/
-        sudo cp -r node-${NODE_VERSION}-linux-x64/lib/* /usr/local/lib/
-        rm -rf node-${NODE_VERSION}-linux-x64 node-${NODE_VERSION}-linux-x64.tar.xz
-        
-        # Verify installation
-        if type node > /dev/null 2>&1 && type npm > /dev/null 2>&1; then
-            echo "Node.js $(node --version) and npm $(npm --version) installed successfully"
-        else
-            echo "Node.js or npm installation may have failed, please check manually"
-        fi
-    else
+    if type node > /dev/null 2>&1 && type npm > /dev/null 2>&1; then
         echo "Node.js $(node --version) and npm $(npm --version) are already installed"
+        exit 0
+    fi
+
+    if [ "{{platform}}" = "macos" ]; then
+        echo "Installing Node.js with Homebrew ({{NODE_BREW_FORMULA}})..."
+        brew install {{NODE_BREW_FORMULA}}
+        # Versioned Node formulae are keg-only, so expose it on PATH
+        brew link --overwrite --force {{NODE_BREW_FORMULA}} || true
+        export PATH="$(brew --prefix {{NODE_BREW_FORMULA}})/bin:$PATH"
+    else
+        echo "Installing Node.js and npm from binary distribution..."
+        case "$(uname -m)" in
+            x86_64|amd64) node_arch="x64" ;;
+            aarch64|arm64) node_arch="arm64" ;;
+            *) echo "Unsupported architecture for Node.js: $(uname -m)"; exit 1 ;;
+        esac
+        node_dir="node-{{NODE_VERSION}}-linux-${node_arch}"
+        curl -fsSL "https://nodejs.org/dist/{{NODE_VERSION}}/${node_dir}.tar.xz" -o "${node_dir}.tar.xz"
+        tar -xf "${node_dir}.tar.xz"
+        sudo cp -r "${node_dir}"/bin/* /usr/local/bin/
+        sudo cp -r "${node_dir}"/lib/* /usr/local/lib/
+        rm -rf "${node_dir}" "${node_dir}.tar.xz"
+    fi
+
+    # Verify installation
+    if type node > /dev/null 2>&1 && type npm > /dev/null 2>&1; then
+        echo "Node.js $(node --version) and npm $(npm --version) installed successfully"
+    else
+        echo "Node.js or npm installation may have failed, please check manually"
     fi
 
 # Install Neovim
 install-nvim: install-nodejs
     #!/bin/bash
+    {{brew_env}}
     if ! type nvim > /dev/null 2>&1; then
         echo "Installing Neovim..."
-        # First try: use the official PPA (this is Ubuntu's recommended method)
-        if sudo add-apt-repository ppa:neovim-ppa/unstable -y && \
-           sudo apt-get update && \
-           sudo apt-get install -y neovim; then
-            echo "Neovim successfully installed from PPA."
+        if [ "{{platform}}" = "macos" ]; then
+            brew install neovim
         else
-            # Second try: download the pre-compiled binary
-            echo "PPA installation failed, trying to download pre-compiled binary..."
-            NVIM_VERSION="v0.9.5"
-            wget -q "https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux64.tar.gz"
-            if [ -f "nvim-linux64.tar.gz" ]; then
-                sudo rm -rf /opt/nvim
-                sudo mkdir -p /opt/nvim
-                sudo tar -xzf nvim-linux64.tar.gz -C /opt/nvim --strip-components=1
-                rm -f nvim-linux64.tar.gz
-                sudo ln -sf /opt/nvim/bin/nvim /usr/local/bin/nvim
-                echo "Neovim installed via pre-compiled binary."
+            # First try: use the official PPA (this is Ubuntu's recommended method)
+            if sudo add-apt-repository ppa:neovim-ppa/unstable -y && \
+               sudo apt-get update && \
+               sudo apt-get install -y neovim; then
+                echo "Neovim successfully installed from PPA."
             else
-                # Third try: use apt repository (may be outdated)
-                echo "Binary download failed, trying apt repository..."
-                sudo apt-get update && sudo apt-get install -y neovim
+                # Second try: download the pre-compiled binary (x86_64 only upstream)
+                echo "PPA installation failed, trying to download pre-compiled binary..."
+                if [ "$(uname -m)" = "x86_64" ]; then
+                    wget -q "https://github.com/neovim/neovim/releases/download/{{NVIM_VERSION}}/nvim-linux64.tar.gz"
+                fi
+                if [ -f "nvim-linux64.tar.gz" ]; then
+                    sudo rm -rf /opt/nvim
+                    sudo mkdir -p /opt/nvim
+                    sudo tar -xzf nvim-linux64.tar.gz -C /opt/nvim --strip-components=1
+                    rm -f nvim-linux64.tar.gz
+                    sudo ln -sf /opt/nvim/bin/nvim /usr/local/bin/nvim
+                    echo "Neovim installed via pre-compiled binary."
+                else
+                    # Third try: use apt repository (may be outdated)
+                    echo "Binary download failed, trying apt repository..."
+                    sudo apt-get update && sudo apt-get install -y neovim
+                fi
             fi
         fi
         # Set up the editor alternatives
         if type nvim > /dev/null 2>&1; then
             # Store the path to nvim using command substitution
             NVIM_PATH="$(command -v nvim)"
-            sudo update-alternatives --install /usr/bin/vi vi "${NVIM_PATH}" 110
-            sudo update-alternatives --install /usr/bin/vim vim "${NVIM_PATH}" 110
-            sudo update-alternatives --install /usr/bin/editor editor "${NVIM_PATH}" 110
+            # update-alternatives is Debian-specific; macOS has no equivalent
+            if command -v update-alternatives > /dev/null 2>&1; then
+                sudo update-alternatives --install /usr/bin/vi vi "${NVIM_PATH}" 110
+                sudo update-alternatives --install /usr/bin/vim vim "${NVIM_PATH}" 110
+                sudo update-alternatives --install /usr/bin/editor editor "${NVIM_PATH}" 110
+            fi
             # Create aliases in /usr/local/bin if they don't exist
+            sudo mkdir -p /usr/local/bin
             for cmd in ex view vimdiff; do
                 if ! type "${cmd}" > /dev/null 2>&1; then
                     echo '#!/bin/sh' | sudo tee "/usr/local/bin/${cmd}" > /dev/null
@@ -144,6 +185,7 @@ install-nvim: install-nodejs
 # Update Neovim configuration
 update-nvim: install-nvim
     #!/bin/bash
+    {{brew_env}}
     mkdir -p "${HOME}/.config/nvim"
     if [ -f "${HOME}/.config/nvim/init.vim" ]; then
         cat "${HOME}/.config/nvim/init.vim" > "${HOME}/.config/nvim/init.vim.bak"
@@ -158,14 +200,14 @@ update-nvim: install-nvim
     else
         echo "Warning: Could not find init.vim in current directory. Skipping."
     fi
-    
+
     # Install vim-plug if not already installed
     if [ ! -f "${HOME}/.local/share/nvim/site/autoload/plug.vim" ]; then
         echo "Installing vim-plug..."
         curl -fLo "${HOME}/.local/share/nvim/site/autoload/plug.vim" --create-dirs \
             https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim
     fi
-    
+
     # Continue with plugin installation
     nvim -c "PlugInstall" -c "qa" || echo "PlugInstall failed, continuing anyway"
     nvim -c "PlugUpdate" -c "qa" || echo "PlugUpdate failed, continuing anyway"
@@ -173,90 +215,105 @@ update-nvim: install-nvim
 # Install AWS CLI v2
 install-aws:
     #!/bin/bash
+    {{brew_env}}
     # Thoroughly remove any existing AWS CLI installations
     echo "Checking for existing AWS CLI installations..."
-    
+
     # Check current version if AWS CLI is installed
     if type aws > /dev/null 2>&1; then
         AWS_VERSION=$(aws --version 2>&1)
         echo "Found AWS CLI: $AWS_VERSION"
-        
+
         # If it's already v2, no action needed
         if [[ "$AWS_VERSION" == *"aws-cli/2."* ]]; then
             echo "AWS CLI v2 is already installed."
             exit 0
         fi
-        
+
         echo "Found non-v2 AWS CLI. Removing all installations..."
     else
         echo "No AWS CLI found. Will install v2."
     fi
-    
+
     # Remove all known installation methods
-    
-    # 1. apt-installed
-    if dpkg -l | grep -q awscli; then
+
+    # 1. distro-packaged (Debian/Ubuntu only)
+    if command -v dpkg > /dev/null 2>&1 && dpkg -l | grep -q awscli; then
         echo "Removing apt-installed AWS CLI..."
         sudo apt remove -y awscli
         sudo apt autoremove -y
     fi
-    
+
     # 2. pip/uv-installed in system Python
     echo "Removing pip-installed AWS CLI from system Python..."
     pip uninstall -y awscli botocore 2>/dev/null || true
     pip3 uninstall -y awscli botocore 2>/dev/null || true
-    
+
     # 3. Check all virtual environments including dotfiles and any user environments
     if [ -d "${HOME}/dotfiles/.venv" ]; then
         echo "Removing AWS CLI from dotfiles virtual environment..."
         ${HOME}/dotfiles/.venv/bin/pip uninstall -y awscli botocore 2>/dev/null || true
     fi
-    
+
     # 4. uv-installed
     if type uv > /dev/null 2>&1; then
         echo "Removing uv-installed AWS CLI..."
         uv pip uninstall --all -y awscli botocore 2>/dev/null || true
     fi
-    
-    # 5. Remove from PATH - check common locations
+
+    # 5. Remove from PATH - check common locations. Anything inside the Homebrew
+    # prefix is skipped: on Intel macOS the prefix IS /usr/local, so deleting
+    # /usr/local/bin/aws would drop Homebrew's symlink while leaving the Cellar
+    # intact, and the `brew install` below would no-op and never restore it.
+    BREW_PREFIX=""
+    if command -v brew > /dev/null 2>&1; then
+        BREW_PREFIX="$(brew --prefix)"
+    fi
     for awspath in /usr/local/bin/aws /usr/bin/aws ~/.local/bin/aws ~/bin/aws; do
+        if [ -n "$BREW_PREFIX" ] && [ "${awspath#$BREW_PREFIX/}" != "$awspath" ]; then
+            echo "Leaving Homebrew-managed $awspath alone."
+            continue
+        fi
         if [ -f "$awspath" ] || [ -L "$awspath" ]; then
             echo "Removing AWS CLI binary at $awspath..."
             sudo rm -f "$awspath" 2>/dev/null || rm -f "$awspath" 2>/dev/null
         fi
     done
-    
+
     # 6. Check bundled installations
     if [ -d "/usr/local/aws-cli" ]; then
         echo "Removing bundled AWS CLI installation..."
         sudo rm -rf "/usr/local/aws-cli"
     fi
-    
-    # Verify all aws binaries are gone
-    echo "Checking if AWS CLI was successfully removed..."
-    if type aws > /dev/null 2>&1; then
-        AWS_PATH=$(which aws)
-        echo "⚠️ WARNING: AWS CLI is still present at: $AWS_PATH"
-        echo "Trying to forcefully remove it..."
-        sudo rm -f "$AWS_PATH" 2>/dev/null || rm -f "$AWS_PATH" 2>/dev/null
-    fi
-    
+
     # Install AWS CLI v2
     echo "Installing AWS CLI v2..."
-    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-    unzip -q awscliv2.zip
-    
-    # Use --update if /usr/local/aws-cli exists to handle reinstallation
-    if [ -d "/usr/local/aws-cli" ]; then
-        sudo ./aws/install --update
+    if [ "{{platform}}" = "macos" ]; then
+        brew install awscli || brew upgrade awscli || true
+        # Re-create the symlinks in case a previous cleanup pass removed them
+        brew link --overwrite awscli || true
     else
-        sudo ./aws/install
+        case "$(uname -m)" in
+            x86_64|amd64) aws_arch="x86_64" ;;
+            aarch64|arm64) aws_arch="aarch64" ;;
+            *) echo "Unsupported architecture for AWS CLI: $(uname -m)"; exit 1 ;;
+        esac
+        curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${aws_arch}.zip" -o "awscliv2.zip"
+        unzip -q awscliv2.zip
+
+        # Use --update if /usr/local/aws-cli exists to handle reinstallation
+        if [ -d "/usr/local/aws-cli" ]; then
+            sudo ./aws/install --update
+        else
+            sudo ./aws/install
+        fi
+
+        # Clean up downloaded files
+        rm -rf aws awscliv2.zip
     fi
-    
-    # Clean up downloaded files
-    rm -rf aws awscliv2.zip
-    
+
     # Verify installation
+    hash -r 2>/dev/null || true
     if type aws > /dev/null 2>&1; then
         AWS_VERSION=$(aws --version 2>&1)
         if [[ "$AWS_VERSION" == *"aws-cli/2."* ]]; then
@@ -271,15 +328,22 @@ install-aws:
 # Install VS Code
 install-vscode:
     #!/bin/bash
-    if ! type code > /dev/null 2>&1; then
+    {{brew_env}}
+    if type code > /dev/null 2>&1; then
+        echo "VS Code is already installed."
+    elif [ "{{platform}}" = "macos" ]; then
+        if [ -d "/Applications/Visual Studio Code.app" ]; then
+            echo "VS Code is already installed (in /Applications)."
+        else
+            brew install --cask visual-studio-code
+        fi
+    else
         wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > packages.microsoft.gpg
         sudo install -D -o root -g root -m 644 packages.microsoft.gpg /etc/apt/keyrings/packages.microsoft.gpg
         sudo sh -c 'echo "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main" > /etc/apt/sources.list.d/vscode.list'
         rm -f packages.microsoft.gpg
         sudo apt update
         sudo apt install code -y
-    else
-        echo "VS Code is already installed."
     fi
 
 # Link Claude config file
@@ -293,21 +357,26 @@ restart-shell:
 # Verify installation
 verify-install:
     #!/bin/bash
+    {{brew_env}}
     echo -e "\n=== Verifying installation and configuration ==="
     # Check system info first
     echo -e "\n--- System Information ---"
-    echo "OS: $(cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d \")"
+    if [ "{{platform}}" = "macos" ]; then
+        echo "OS: $(sw_vers -productName) $(sw_vers -productVersion) ($(sw_vers -buildVersion))"
+    else
+        echo "OS: $(grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d \")"
+    fi
     echo "Architecture: $(uname -m)"
     echo "Kernel: $(uname -r)"
     echo "Hostname: $(hostname)"
     echo "Username: $(whoami)"
-    
+
     # Check $PATH environment variable
     echo -e "\n--- PATH Environment Variable ---"
     echo "Current PATH: $PATH"
     echo "PATH components:"
     echo "$PATH" | tr ':' '\n'
-    
+
     echo -e "\n--- Checking shell configuration ---"
     SHELLS=0
     for shell_conf in ~/.zshrc ~/.bashrc ~/.profile ~/.bash_profile; do
@@ -324,11 +393,21 @@ verify-install:
     if [ "$SHELLS" -eq 0 ]; then
         echo "⚠️ No shell config files found"
     fi
-    
+
+    if [ "{{platform}}" = "macos" ]; then
+        echo -e "\n--- Checking Homebrew ---"
+        if command -v brew >/dev/null 2>&1; then
+            echo "✓ brew: $(brew --version | head -n 1)"
+            echo "  prefix: $(brew --prefix)"
+        else
+            echo "⚠️ brew not installed"
+        fi
+    fi
+
     echo -e "\n--- Checking Python installation ---"
     # First check in common locations for uv
     UV_FOUND=false
-    for uv_path in "$HOME/.local/bin/uv" "/usr/local/bin/uv" "/usr/bin/uv"; do
+    for uv_path in "$HOME/.local/bin/uv" "/usr/local/bin/uv" "/usr/bin/uv" "/opt/homebrew/bin/uv"; do
         if [ -f "$uv_path" ]; then
             echo "✓ uv binary found at: $uv_path"
             UV_FOUND=true
@@ -342,11 +421,11 @@ verify-install:
             break
         fi
     done
-    
+
     if ! $UV_FOUND; then
         echo "⚠️ uv binary not found in common locations"
     fi
-    
+
     # Then check using command -v
     if command -v uv >/dev/null 2>&1; then
         echo "✓ uv: $(uv --version 2>&1 | head -n 1)"
@@ -354,7 +433,7 @@ verify-install:
     else
         echo "⚠️ uv not accessible through PATH"
     fi
-    
+
     # Check available Python versions
     echo -e "\n--- Available Python versions ---"
     for pyver in python python3 python3.8 python3.9 python3.10 python3.11 python3.12; do
@@ -363,14 +442,14 @@ verify-install:
             echo "  Path: $(which $pyver)"
         fi
     done
-    
+
     # Primary Python
     if command -v python3 >/dev/null 2>&1; then
         echo "✓ python: $(python3 --version)"
     else
         echo "⚠️ python not installed"
     fi
-    
+
     echo -e "\n--- Checking core tooling ---"
     if command -v aws >/dev/null 2>&1; then
         echo "✓ aws: $(aws --version 2>&1)"
@@ -378,37 +457,37 @@ verify-install:
     else
         echo "⚠️ aws not installed"
     fi
-    
+
     if command -v git >/dev/null 2>&1; then
         echo "✓ git: $(git --version)"
     else
         echo "⚠️ git not installed"
     fi
-    
+
     if command -v node >/dev/null 2>&1; then
         echo "✓ node: $(node --version)"
     else
         echo "⚠️ node not installed"
     fi
-    
+
     if command -v npm >/dev/null 2>&1; then
         echo "✓ npm: $(npm --version)"
     else
         echo "⚠️ npm not installed"
     fi
-    
+
     if command -v nvim >/dev/null 2>&1; then
         echo "✓ nvim: $(nvim --version | head -n 1)"
     else
         echo "⚠️ nvim not installed"
     fi
-    
+
     if command -v ninja >/dev/null 2>&1; then
         echo "✓ ninja: $(ninja --version)"
     else
         echo "⚠️ ninja not installed"
     fi
-    
+
     echo -e "\n--- Checking additional tools ---"
     for tool in cruft dive hadolint lazydocker just; do
         if command -v $tool >/dev/null 2>&1; then
@@ -417,7 +496,7 @@ verify-install:
         else
             echo "⚠️ $tool not installed"
             # Try to find the binary in common locations
-            for tool_path in "$HOME/.local/bin/$tool" "/usr/local/bin/$tool" "/usr/bin/$tool"; do
+            for tool_path in "$HOME/.local/bin/$tool" "/usr/local/bin/$tool" "/usr/bin/$tool" "/opt/homebrew/bin/$tool"; do
                 if [ -f "$tool_path" ]; then
                     echo "  Found binary at: $tool_path"
                     ls -la "$tool_path"
@@ -426,21 +505,21 @@ verify-install:
             done
         fi
     done
-    
+
     echo -e "\n--- Checking config files ---"
-    
+
     if [ -f "${HOME}/.config/nvim/init.vim" ]; then
         echo "✓ Neovim config exists"
     else
         echo "⚠️ Neovim config not found"
     fi
-    
+
     if [ -f "${HOME}/.claude/claude.md" ]; then
         echo "✓ Claude.md linked"
     else
         echo "⚠️ Claude.md not linked"
     fi
-    
+
     echo -e "\n=== Verification complete ===\n"
     echo "For any warnings above, you might want to run the specific target manually or check the logs."
 
@@ -451,26 +530,41 @@ verify-install:
 # Install PyMol for molecular visualization
 optional-install-pymol:
     #!/bin/bash
+    {{brew_env}}
     if command -v pymol >/dev/null 2>&1; then
         echo "PyMol is already installed: $(pymol --version 2>&1 | head -n 1 || echo "version unknown")"
+    elif [ "{{platform}}" = "macos" ]; then
+        echo "Installing PyMol with Homebrew..."
+        brew install pymol
+        if command -v pymol >/dev/null 2>&1; then
+            echo "✅ PyMol installed successfully"
+        else
+            echo "❌ PyMol installation failed"
+        fi
     else
         echo "Installing PyMol..."
-        
+
+        # The upstream Linux installer is x86_64-only
+        if [ "$(uname -m)" != "x86_64" ]; then
+            echo "⚠️ No prebuilt Linux PyMol for $(uname -m); install it from your package manager instead."
+            exit 0
+        fi
+
         # Create directories if they don't exist
         mkdir -p "$HOME/pymol"
         mkdir -p "$HOME/.local/bin"
-        
+
         # Download and extract PyMol
         PYMOL_URL="https://storage.googleapis.com/pymol-storage/installers/PyMOL-3.1.3.1_appveyor1974-Linux-x86_64-py310.tar.bz2"
         PYMOL_TAR="/tmp/pymol.tar.bz2"
-        
+
         wget -O "$PYMOL_TAR" "$PYMOL_URL"
         tar -xjf "$PYMOL_TAR" -C "$HOME/pymol" --strip-components=1
         rm -f "$PYMOL_TAR"
-        
+
         # Create symlink
         ln -sf "$HOME/pymol/pymol" "$HOME/.local/bin/pymol"
-        
+
         if command -v pymol >/dev/null 2>&1; then
             echo "✅ PyMol installed successfully"
         else
@@ -481,20 +575,33 @@ optional-install-pymol:
 # Install Slack
 optional-install-slack:
     #!/bin/bash
-    if command -v slack >/dev/null 2>&1 || [ -d "/usr/lib/slack" ] || [ -d "/opt/slack" ]; then
+    {{brew_env}}
+    if [ "{{platform}}" = "macos" ]; then
+        if [ -d "/Applications/Slack.app" ]; then
+            echo "Slack is already installed"
+        else
+            echo "Installing Slack with Homebrew..."
+            brew install --cask slack
+            if [ -d "/Applications/Slack.app" ]; then
+                echo "✅ Slack installed successfully"
+            else
+                echo "❌ Slack installation failed"
+            fi
+        fi
+    elif command -v slack >/dev/null 2>&1 || [ -d "/usr/lib/slack" ] || [ -d "/opt/slack" ]; then
         echo "Slack is already installed"
     else
         echo "Installing Slack..."
-        
+
         # Using Slack's DEB package as referenced in the instructions
         sudo apt-get update
-        
+
         wget -O /tmp/slack.deb "https://downloads.slack-edge.com/releases/linux/4.33.73/prod/x64/slack-desktop-4.33.73-amd64.deb" || \
             wget -O /tmp/slack.deb "https://downloads.slack-edge.com/linux_releases/slack-desktop-4.29.149-amd64.deb"
-        
+
         sudo apt-get install -y /tmp/slack.deb
         rm -f /tmp/slack.deb
-        
+
         if [ -d "/usr/lib/slack" ] || [ -d "/opt/slack" ] || command -v slack >/dev/null 2>&1; then
             echo "✅ Slack installed successfully"
         else
@@ -502,80 +609,111 @@ optional-install-slack:
         fi
     fi
 
-# Install Docker rootless
+# Install Docker (rootless on Linux, Docker Desktop on macOS)
 optional-install-docker:
     #!/bin/bash
+    {{brew_env}}
     if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
         echo "Docker is already installed and running: $(docker --version)"
-    else
-        echo "Installing Docker rootless according to instructions..."
-        
-        # Remove existing Docker installations as per instructions
-        for pkg in docker.io docker-doc docker-compose; do
-            sudo apt-get -y remove $pkg || true
-        done
-        
-        # Install Docker
-        sudo apt-get -y update
-        sudo install -m 0755 -d /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-        sudo chmod a+r /etc/apt/keyrings/docker.gpg
-        
-        echo \
-          "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-          $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-          sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-          
-        sudo apt-get -y update
-        sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-        
-        # Set up rootless Docker
-        sudo systemctl disable --now docker.service docker.socket
-        sudo rm -f /var/run/docker.sock
-        
-        # Install and configure rootless Docker
-        sudo apt-get install -y uidmap dbus-user-session fuse-overlayfs slirp4netns
-        dockerd-rootless-setuptool.sh install --force
-        
-        # Enable the service
-        systemctl --user enable docker
-        loginctl enable-linger $(whoami)
-        
-        # Add environment variables to shell config
-        echo 'export PATH=$HOME/bin:$PATH' >> "$HOME/.bashrc"
-        echo 'export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock' >> "$HOME/.bashrc"
-        
-        if [ -f "$HOME/.zshrc" ]; then
-            echo 'export PATH=$HOME/bin:$PATH' >> "$HOME/.zshrc"
-            echo 'export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock' >> "$HOME/.zshrc"
+        exit 0
+    fi
+
+    if [ "{{platform}}" = "macos" ]; then
+        # macOS has no rootless daemon; Docker Desktop is the supported route
+        if [ -d "/Applications/Docker.app" ]; then
+            echo "Docker Desktop is installed but not running. Start it with: open -a Docker"
+            exit 0
         fi
-        
-        if command -v docker >/dev/null 2>&1; then
-            echo "✅ Docker rootless installed successfully"
-            echo "To use Docker in current session without logout/login:"
-            echo "export PATH=$HOME/bin:$PATH"
-            echo "export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock"
+        echo "Installing Docker Desktop with Homebrew..."
+        brew install --cask docker-desktop || brew install --cask docker
+        if [ -d "/Applications/Docker.app" ]; then
+            echo "✅ Docker Desktop installed successfully"
+            echo "Start it once to finish setup: open -a Docker"
         else
-            echo "❌ Docker rootless installation failed"
+            echo "❌ Docker Desktop installation failed"
         fi
+        exit 0
+    fi
+
+    echo "Installing Docker rootless according to instructions..."
+
+    # Remove existing Docker installations as per instructions
+    for pkg in docker.io docker-doc docker-compose; do
+        sudo apt-get -y remove $pkg || true
+    done
+
+    # Install Docker
+    sudo apt-get -y update
+    sudo install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+      sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+    sudo apt-get -y update
+    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+    # Set up rootless Docker
+    sudo systemctl disable --now docker.service docker.socket
+    sudo rm -f /var/run/docker.sock
+
+    # Install and configure rootless Docker
+    sudo apt-get install -y uidmap dbus-user-session fuse-overlayfs slirp4netns
+    dockerd-rootless-setuptool.sh install --force
+
+    # Enable the service
+    systemctl --user enable docker
+    loginctl enable-linger $(whoami)
+
+    # Add environment variables to shell config (guarded so reruns don't duplicate)
+    for rc_file in "$HOME/.bashrc" "$HOME/.zshrc"; do
+        [ -f "$rc_file" ] || continue
+        grep -q 'DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock' "$rc_file" && continue
+        echo 'export PATH=$HOME/bin:$PATH' >> "$rc_file"
+        echo 'export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock' >> "$rc_file"
+    done
+
+    if command -v docker >/dev/null 2>&1; then
+        echo "✅ Docker rootless installed successfully"
+        echo "To use Docker in current session without logout/login:"
+        echo "export PATH=$HOME/bin:$PATH"
+        echo "export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock"
+    else
+        echo "❌ Docker rootless installation failed"
     fi
 
 # Install AWS VPN Client
 optional-install-awsvpn:
     #!/bin/bash
-    if [ -d "/opt/awsvpnclient" ]; then
+    {{brew_env}}
+    if [ "{{platform}}" = "macos" ]; then
+        if [ -d "/Applications/AWS VPN Client" ]; then
+            echo "AWS VPN Client is already installed"
+        else
+            echo "Installing AWS VPN Client with Homebrew..."
+            brew install --cask aws-vpn-client
+            if [ -d "/Applications/AWS VPN Client" ]; then
+                echo "✅ AWS VPN Client installed successfully"
+            else
+                echo "❌ AWS VPN Client installation failed"
+            fi
+        fi
+    elif [ -d "/opt/awsvpnclient" ]; then
         echo "AWS VPN Client is already installed"
     else
         echo "Installing AWS VPN Client according to instructions..."
-        
+
         # Add AWS VPN Client repository as per instructions
         wget -qO- https://d20adtppz83p9s.cloudfront.net/GTK/latest/debian-repo/awsvpnclient_public_key.asc | sudo tee /etc/apt/trusted.gpg.d/awsvpnclient_public_key.asc
         echo "deb [arch=amd64] https://d20adtppz83p9s.cloudfront.net/GTK/latest/debian-repo ubuntu main" | sudo tee /etc/apt/sources.list.d/aws-vpn-client.list
-        
+
         # Install the client
         sudo apt-get update
         sudo apt-get install -y awsvpnclient
-        
+
         if [ -d "/opt/awsvpnclient" ]; then
             echo "✅ AWS VPN Client installed successfully"
         else
@@ -586,7 +724,8 @@ optional-install-awsvpn:
 # Install all optional tools if on a personal machine
 optional-installs:
     #!/bin/bash
-    if [ "$(whoami)" = "ubuntu" ]; then
+    # The `ubuntu` user indicates an EC2/cloud box; macOS is always personal
+    if [ "{{platform}}" != "macos" ] && [ "$(whoami)" = "ubuntu" ]; then
         echo "Detected EC2/cloud user, skipping all optional installations"
     else
         echo "Personal machine detected, installing optional tools..."
