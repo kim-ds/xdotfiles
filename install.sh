@@ -242,7 +242,7 @@ else
     touch ${HOME}/.zshrc
     echo "Shell changed to Zsh. Please re-login and rerun this script."
     echo "Or run"
-    echo "cd ${HOME}/dotfiles && just"
+    echo "cd ${HOME}/xdotfiles && just"
     echo "Exiting..."
     sleep 3
     exit 0
