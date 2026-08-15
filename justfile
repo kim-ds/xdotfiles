@@ -714,6 +714,46 @@ optional-install-awsvpn:
         sudo apt-get update
         sudo apt-get install -y awsvpnclient
 
+        # AWS builds the .deb with a zstd-compressed control.tar, which dpkg only
+        # learned to read in 1.21.18 (Ubuntu 24.04+). On older releases the install
+        # above dies with "unknown compression for member 'control.tar.zst'", so
+        # repack the archive with gzip members and install that instead.
+        if [ ! -d "/opt/awsvpnclient" ]; then
+            echo "Direct install failed; repacking the .deb without zstd..."
+
+            # Clear the half-unpacked state the failed install left behind
+            sudo dpkg --configure -a || true
+            sudo apt-get install -f -y || true
+            sudo rm -f /var/cache/apt/archives/awsvpnclient_*.deb
+
+            sudo apt-get install -y zstd binutils
+
+            repack_dir="$(mktemp -d)"
+            chmod 755 "$repack_dir"  # apt drops to the _apt user to download
+            pushd "$repack_dir" >/dev/null
+
+            if apt-get download awsvpnclient; then
+                ar x "$(ls awsvpnclient_*.deb | head -n 1)"
+
+                # debian-binary stays first and uncompressed; only the tarballs move to gzip
+                for member in control data; do
+                    if [ -f "$member.tar.zst" ]; then
+                        zstd -dq "$member.tar.zst" -o "$member.tar" && gzip -n "$member.tar"
+                        rm -f "$member.tar.zst"
+                    fi
+                done
+
+                ar rcD awsvpnclient-repacked.deb debian-binary \
+                    "$(ls control.tar.* | head -n 1)" "$(ls data.tar.* | head -n 1)"
+                sudo apt-get install -y ./awsvpnclient-repacked.deb
+            else
+                echo "Could not download the awsvpnclient .deb for repacking"
+            fi
+
+            popd >/dev/null
+            rm -rf "$repack_dir"
+        fi
+
         if [ -d "/opt/awsvpnclient" ]; then
             echo "✅ AWS VPN Client installed successfully"
         else
